@@ -4,7 +4,9 @@ Practise English while you use Claude Code. Toggle with `/tutor`. When on, each 
 
 Click a block in the pane to ask about it: the feedback, or any answer under it. A field opens at the bottom of the card and Haiku answers there, seeing only the card and the thread leading to the chosen block (its last three questions). Esc returns to the prompt; an empty field closes with your next prompt.
 
-Each review and follow-up, with Haiku's reply and token use, is appended to `~/.claude/english-tutor/log.jsonl` on your machine (its last 1000 lines are kept). Nothing else is written, and the calls go through your own Claude Code session.
+Only prompts you type yourself are reviewed (not a `/loop`, a task's notification or a `claude -p` run), and nothing about the tutor reaches the agent's conversation: even `/tutor` is blanked there. In a terminal too narrow to dock the pane nothing is reviewed until you open it with `/tutor` or the button above the prompt.
+
+Each review and follow-up, with Haiku's reply and token use, is written to `~/.claude/english-tutor/log/<date>.jsonl` on your machine, a file a day. Nothing else is written, and the calls go through your own Claude Code session.
 
 ## Install
 

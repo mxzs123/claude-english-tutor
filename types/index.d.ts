@@ -22,6 +22,7 @@ declare module 'claude-code' {
   interface PluginState {
     'english-tutor': {
       isOn: boolean
+      isPlaced: boolean
       useContext: boolean
       pending: Shaped<string[]>
       frame: number

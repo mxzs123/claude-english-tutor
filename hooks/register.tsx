@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, TextProps } from 'claude-code'
+import type { EngineInterface, Register, TextProps, Timer } from 'claude-code'
 
 import type { Entry, FollowUp, Word } from '../types'
 
@@ -14,19 +14,22 @@ const PREV_PROMPTS = 2
 const PREV_CHARS = 200
 const MAX_FIXES = 4
 const MAX_WORDS = 3
-const LOG_LINES = 1000
 // A follow-up carries only its card and the card's last few questions.
 const FOLLOW_ROUNDS = 3
 
 // On in every session from its start; the person's close of the pane turns
 // it off for that session alone, and nothing is reviewed while it is off.
 const isOn = atom({ plugin: 'english-tutor', key: 'isOn' } as const, true)
+// Whether a surface draws the pane: one opened unasked waits undrawn on a
+// narrow terminal, and nothing is reviewed for a pane nobody can see.
+const isPlaced = atom({ plugin: 'english-tutor', key: 'isPlaced' } as const, true)
 const useContext = atom({ plugin: 'english-tutor', key: 'useContext' } as const, true)
 // Prompts sent and not yet reviewed, oldest first: drawn with a spinner.
 const pending = atom({ plugin: 'english-tutor', key: 'pending' } as const, [], { shape: 'pending-1' })
 const frame = atom({ plugin: 'english-tutor', key: 'frame' } as const, 0)
 const FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
-// One timer both picks up the queue and turns the spinner.
+// One timer both works through the queue and turns the spinner, running
+// only while there is work.
 const TICK_MS = 120
 const entries = atom({ plugin: 'english-tutor', key: 'entries' } as const, [], {
   shape: 'entries-1',
@@ -54,7 +57,7 @@ Step 1, decide the mode (when <mode> is absent) by which language carries the gr
 - Whole sentences in both languages: the language of most of the text.
 
 Step 2, by mode:
-- "check": "fixes" lists only real mistakes or clearly unnatural phrasing, at most ${MAX_FIXES}. Each fix covers its own part of the prompt: no two fixes overlap and no fix repeats another inside a longer span. Never list a part that is already fine. "from" is the original fragment, "to" the replacement, "why" one short Chinese sentence. "natural" is the whole prompt as a native developer would type it. Any Chinese inside an English prompt is something the developer could not yet say in English: give each Chinese fragment its own fix, "from" the Chinese, "to" the English that fits the sentence, "why" a short Chinese note on the word. Use mode "clean" (everything else empty) only when the prompt is all English and already natural.
+- "check": "fixes" lists only real mistakes or clearly unnatural phrasing, at most ${MAX_FIXES}. Each fix covers its own part of the prompt: no two fixes overlap and no fix repeats another inside a longer span. Never list a part that is already fine. "from" is the original fragment, "to" the replacement ("" when the fragment should simply go), "why" one short Chinese sentence. "natural" is the whole prompt as a native developer would type it. Any Chinese inside an English prompt is something the developer could not yet say in English: give each Chinese fragment its own fix, "from" the Chinese, "to" the English that fits the sentence, "why" a short Chinese note on the word. Use mode "clean" (everything else empty) only when the prompt is all English and already natural.
 - "tutor": "natural" is how a native developer would type this prompt in English: casual and concise, as people really write to a coding assistant. "words" holds 2-${MAX_WORDS} English words or phrases that appear exactly in "natural" and are worth learning; skip basic words, skip English words the developer already wrote in the prompt, never explain Chinese words. "meaning" is a short Chinese gloss. "note" is one short Chinese sentence on the key phrasing or grammar. "fixes" is empty.
 
 Keep code, file names, commands and technical terms unchanged.
@@ -75,7 +78,7 @@ type Run = [string, Omit<TextProps, 'hover'>]
 // How every run of a hovered or chosen block is drawn: one gray.
 const LIT = { color: 'inactive', dimColor: false } as const
 
-const CJK = /[㐀-鿿豈-﫿]/
+const CJK = /[㐀-鿿豈-﫿]/
 const LATIN = /[a-zA-Z]/
 
 // The two cases code can be sure of; a mix is left to Haiku.
@@ -85,36 +88,60 @@ function sureMode(text: string): 'check' | 'tutor' | undefined {
   return undefined
 }
 
-// Recent conversation, kept in the module: a reload just starts it over.
+// Recent conversation, kept in the module: a reload or a /clear starts it over.
 let prevPrompts: string[] = []
 let lastReply = ''
 
+// Cuts by characters, never through the middle of one.
 function clip(text: string, max: number, keepEnd = false) {
-  if (text.length <= max) return text
-  return keepEnd ? '…' + text.slice(-max) : text.slice(0, max) + '…'
+  const chars = Array.from(text)
+  if (chars.length <= max) return text
+  return keepEnd ? '…' + chars.slice(-max).join('') : chars.slice(0, max).join('') + '…'
 }
 
-function buildPrompt(text: string, withContext: boolean) {
+// The conversation before a prompt, taken when the prompt is sent.
+function contextNow() {
+  if (prevPrompts.length === 0 && lastReply === '') return ''
+  const lines = prevPrompts.map(p => `User: ${clip(p, PREV_CHARS)}`)
+  if (lastReply !== '') lines.push(`Assistant: ${clip(lastReply, REPLY_TAIL, true)}`)
+  return `<context>\n${lines.join('\n')}\n</context>`
+}
+
+function buildPrompt(text: string, context: string, mode: 'check' | 'tutor' | undefined) {
   const parts: string[] = []
-  if (withContext && (prevPrompts.length > 0 || lastReply !== '')) {
-    const lines = prevPrompts.map(p => `User: ${clip(p, PREV_CHARS)}`)
-    if (lastReply !== '') lines.push(`Assistant: ${clip(lastReply, REPLY_TAIL, true)}`)
-    parts.push(`<context>\n${lines.join('\n')}\n</context>`)
-  }
-  const mode = sureMode(text)
+  if (context !== '') parts.push(context)
   if (mode) parts.push(`<mode>${mode}</mode>`)
   parts.push(`<prompt>\n${text}\n</prompt>`)
   return parts.join('\n\n')
 }
 
 // Prompts waiting for review and follow-ups waiting for an answer. A hook
-// only queues; a timer started at session.start does the calls, so no call
-// is tied to (or cancelled with) the dispatch that queued it.
+// only queues; the timer does the calls, so no call is tied to (or cancelled
+// with) the dispatch that queued it.
 type Job =
-  | { kind: 'review'; text: string; withContext: boolean }
+  | { kind: 'review'; text: string; context: string }
   | { kind: 'follow'; id: number; block: number; q: string }
 let queue: Job[] = []
 let isDraining = false
+// Goes up each time the tutor is turned off, so a call already running when
+// it was finishes without adding anything.
+let epoch = 0
+let ticker: Timer | undefined
+
+function startTicking($: EngineInterface) {
+  if (ticker) return
+  ticker = $.clock.every(TICK_MS, () => {
+    if (queue.length > 0 || isDraining) {
+      void update($, frame, n => (n + 1) % FRAMES.length)
+      void drain($)
+    }
+    if (refocusIn > 0 && --refocusIn === 0) void refocus($)
+    if (queue.length === 0 && !isDraining && refocusIn === 0) {
+      ticker?.cancel()
+      ticker = undefined
+    }
+  })
+}
 
 async function drain($: EngineInterface) {
   if (isDraining || queue.length === 0) return
@@ -124,21 +151,24 @@ async function drain($: EngineInterface) {
       // The person waits on a follow-up; a review runs in the background.
       const i = queue.findIndex(j => j.kind === 'follow')
       const job = queue.splice(i >= 0 ? i : 0, 1)[0]!
+      const at = epoch
       if (job.kind === 'follow') {
         try {
-          await answerFollowUp($, job.id, job.block, job.q)
+          await answerFollowUp($, job.id, job.block, job.q, at)
         } catch (err) {
-          await addFollowUp($, job.id, { q: job.q, a: `出错：${String(err)}`, isError: true })
+          if (epoch === at) await addFollowUp($, job.id, { q: job.q, a: `出错：${String(err)}`, isError: true, about: job.block })
         }
-        await update($, followPending, list => list.slice(1))
+        if (epoch === at) await update($, followPending, list => list.slice(1))
         continue
       }
       try {
-        await review($, job.text, job.withContext)
+        await review($, job.text, job.context, at)
       } catch (err) {
-        await addEntry($, { prompt: job.text, mode: 'error', natural: '', fixes: [], words: [], note: `出错：${String(err)}` })
+        if (epoch === at) {
+          await addEntry($, { prompt: job.text, mode: 'error', natural: '', fixes: [], words: [], note: `出错：${String(err)}` })
+        }
       }
-      await update($, pending, list => list.slice(1))
+      if (epoch === at) await update($, pending, list => list.slice(1))
     }
   } finally {
     isDraining = false
@@ -156,9 +186,10 @@ function normalize(text: string, json: any, forced: 'check' | 'tutor' | undefine
   if (forced === 'tutor') mode = 'tutor'
   if (forced === 'check' && mode === 'tutor') mode = 'check'
   const natural = String(json.natural ?? '')
+  // A fix to "" deletes its fragment.
   const fixes = mode === 'check' && Array.isArray(json.fixes)
     ? json.fixes
-        .filter((f: any) => f && f.from && f.to && String(f.from).trim() !== String(f.to).trim())
+        .filter((f: any) => f && f.from && typeof f.to === 'string' && String(f.from).trim() !== f.to.trim())
         .slice(0, MAX_FIXES)
         .map((f: any) => ({ from: String(f.from), to: String(f.to), why: String(f.why ?? '') }))
     : []
@@ -175,6 +206,10 @@ function normalize(text: string, json: any, forced: 'check' | 'tutor' | undefine
         .slice(0, MAX_WORDS)
     : []
   if (mode === 'check' && fixes.length === 0) mode = 'clean'
+  // A tutor card with no English to show would be an empty card.
+  if (mode === 'tutor' && natural.trim() === '') {
+    return { prompt: text, mode: 'error', natural: '', fixes: [], words: [], note: 'Haiku 没有给出英文说法' }
+  }
 
   return {
     prompt: text,
@@ -209,25 +244,25 @@ async function ask($: EngineInterface, text: string, prompt: string, forced: 'ch
   return { r, entry }
 }
 
-async function review($: EngineInterface, text: string, withContext: boolean) {
-  let prompt = buildPrompt(text, withContext)
-  prevPrompts = [...prevPrompts, text].slice(-PREV_PROMPTS)
+async function review($: EngineInterface, text: string, context: string, at: number) {
+  let prompt = buildPrompt(text, context, sureMode(text))
   let { r, entry } = await ask($, text, prompt, sureMode(text))
   // A prompt with Chinese in it always has something to teach: a "clean"
   // answer is asked again as a tutor.
   if (entry.mode === 'clean' && CJK.test(text)) {
-    prompt = prompt.replace('<prompt>', '<mode>tutor</mode>\n\n<prompt>')
+    prompt = buildPrompt(text, context, 'tutor')
     ;({ r, entry } = await ask($, text, prompt, 'tutor'))
   }
+  if (epoch !== at) return
   await addEntry($, entry)
-  await writeLog($, { at: await $.clock.now(), ask: prompt, reply: r.isAnswered ? r.text : null, entry, usage: r.usage })
+  await writeLog($, { at: await $.clock.now(), kind: 'review', ask: prompt, reply: r.isAnswered ? r.text : null, entry, usage: r.usage })
 }
 
 // The card as Haiku reads it: the prompt and the feedback drawn on it.
 function describeCard(it: Entry) {
   const lines = [`Prompt: ${it.prompt}`]
   if (it.mode === 'clean') lines.push('Feedback: already natural English, nothing to fix.')
-  for (const f of it.fixes) lines.push(`Fix: ${f.from} → ${f.to} (${f.why})`)
+  for (const f of it.fixes) lines.push(f.to === '' ? `Fix: delete "${f.from}" (${f.why})` : `Fix: ${f.from} → ${f.to} (${f.why})`)
   if (it.natural !== '') lines.push(`Natural English: ${it.natural}`)
   for (const w of it.words) lines.push(`Word: ${w.word} — ${w.meaning}`)
   if (it.mode === 'tutor' && it.note !== '') lines.push(`Note: ${it.note}`)
@@ -267,7 +302,7 @@ async function addFollowUp($: EngineInterface, id: number, follow: FollowUp) {
   )
 }
 
-async function answerFollowUp($: EngineInterface, id: number, block: number, q: string) {
+async function answerFollowUp($: EngineInterface, id: number, block: number, q: string, at: number) {
   const it = (await read($, entries)).find(x => x.id === id)
   if (!it) return
   const prompt = buildFollowUp(it, block, q)
@@ -279,6 +314,7 @@ async function answerFollowUp($: EngineInterface, id: number, block: number, q: 
     effort: 'low',
     timeoutMs: 30000,
   })
+  if (epoch !== at) return
   await addFollowUp($, id, r.isAnswered
     ? { q, a: r.text.trim(), about: block }
     : { q, a: `Haiku 没有回答（${r.reason}）`, isError: true, about: block })
@@ -343,30 +379,43 @@ async function submitFollowUp($: EngineInterface, id: number, value: string) {
   await update($, followField, () => ({ ...open, sent }))
   queue.push({ kind: 'follow', id, block: open.block, q })
   await update($, followPending, list => [...list, { id, q }])
+  startTicking($)
   await focusField($, id, sent)
 }
 
-// One JSON line per review, so a past review can be read back later.
-async function writeLog($: EngineInterface, line: unknown) {
-  const root = $.plugin.root
-  const home = root.includes('/.claude/') ? root.split('/.claude/')[0] : root
-  const path = `${home}/.claude/english-tutor/log.jsonl`
+// One JSON line per review and follow-up, a file a day, so a past review can
+// be read back later and no one file grows past what a read takes.
+async function writeLog($: EngineInterface, line: { at: number; [field: string]: unknown }) {
   try {
+    const configDir = await $.env.get('CLAUDE_CONFIG_DIR')
+    const home = (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE'))
+    if (!configDir && !home) return
+    const day = new Date(line.at)
+    const name = [day.getFullYear(), day.getMonth() + 1, day.getDate()].map(n => String(n).padStart(2, '0')).join('-')
+    const path = `${configDir ?? `${home}/.claude`}/english-tutor/log/${name}.jsonl`
     const old = (await $.fs.exists(path)) ? await $.fs.read(path) : ''
-    const lines = (typeof old === 'string' ? old : '').split('\n').filter(l => l !== '')
-    await $.fs.write(path, [...lines, JSON.stringify(line)].slice(-LOG_LINES).join('\n') + '\n')
+    await $.fs.write(path, (typeof old === 'string' ? old : '') + JSON.stringify(line) + '\n')
   } catch {
     // A log that cannot be written never costs the review.
   }
 }
 
+// Asks the surface whether the pane is drawn, and keeps the answer.
+async function checkPlaced($: EngineInterface) {
+  const placed = (await $.ui.panes()).some(p => p.id === PANE && p.isPlaced)
+  await update($, isPlaced, () => placed)
+  return placed
+}
+
 async function turnOn($: EngineInterface) {
   await update($, isOn, () => true)
-  await $.ui.open({ id: PANE, title: TITLE })
+  const r = await $.ui.open({ id: PANE, title: TITLE })
+  await update($, isPlaced, () => r.isPlaced)
 }
 
 async function turnOff($: EngineInterface) {
   await update($, isOn, () => false)
+  epoch++
   queue = []
   await update($, pending, () => [])
   await update($, followPending, () => [])
@@ -382,7 +431,8 @@ async function toggle($: EngineInterface, arg: string) {
     await $.store.set('useContext', want)
     return `✏ English tutor：上下文已${want ? '开启' : '关闭'}`
   }
-  const now = await read($, isOn)
+  // On but undrawn (a narrow terminal) reads as off: /tutor shows it.
+  const now = (await read($, isOn)) && (await checkPlaced($))
   const want = arg === 'on' ? true : arg === 'off' ? false : !now
   if (want) {
     await turnOn($)
@@ -392,6 +442,10 @@ async function toggle($: EngineInterface, arg: string) {
   await $.ui.close({ id: PANE })
   return '✏ English tutor 已关闭'
 }
+
+// /tutor as the engine records it, and its reply under this plugin's name.
+const TUTOR_ROW = /<command-name>\/tutor<\/command-name>|<local-command-stdout>english-tutor:/
+const BLANK_ROW = '<local-command-stdout></local-command-stdout>'
 
 function isWorthChecking(text: string) {
   const t = text.trim()
@@ -415,35 +469,59 @@ export const register: Register = on => {
     await update($, followField, () => null)
     // A reload keeps the session's switch; a new session starts on.
     if (await read($, isOn)) {
-      void $.ui.open({ id: PANE, title: TITLE })
+      void $.ui.open({ id: PANE, title: TITLE }).then(r => update($, isPlaced, () => r.isPlaced))
     }
-    $.clock.every(TICK_MS, () => {
-      if (queue.length > 0 || isDraining) {
-        void update($, frame, n => (n + 1) % FRAMES.length)
-        void drain($)
-      }
-      if (refocusIn > 0 && --refocusIn === 0) void refocus($)
-    })
+
+    return next(e)
+  })
+
+  // A /clear starts a new conversation without a session.start: the old one's
+  // prompts and reply are no context for it.
+  on('session.end', ($, e, next) => {
+    if (e.reason === 'clear') {
+      prevPrompts = []
+      lastReply = ''
+    }
 
     return next(e)
   })
 
   on('prompt.submit', async ($, e, next) => {
     if (e.command?.name === 'tutor') {
-      return { drop: await toggle($, (e.command.args ?? '').trim()) }
+      // The drop's line is blanked in the conversation (session.append below),
+      // so the person reads the answer as a toast.
+      const said = await toggle($, (e.command.args ?? '').trim())
+      void $.ui.toast(said)
+      return { drop: said }
     }
-    if (!e.command && !e.isMeta && isWorthChecking(e.text) && (await read($, isOn))) {
-      const text = e.text.trim()
-      // The context is read when the review runs, so it is built from the
-      // prompts before this one.
-      queue.push({ kind: 'review', text, withContext: await read($, useContext) })
-      await update($, pending, list => [...list, text])
-    }
+    const r = await next(e)
+    // Only what the person typed is theirs to learn from: not a /loop, a task's
+    // notification, another session's message or a script's run.
+    if ('drop' in r || (e.origin.kind !== 'composer' && e.origin.kind !== 'bridge')) return r
     // An empty follow-up field left open closes once the person moves on.
     if (draft === '' && (await read($, followField)) !== null) await update($, followField, () => null)
+    if (!e.command && !e.isMeta && isWorthChecking(e.text) && (await read($, isOn)) && (await checkPlaced($))) {
+      const text = e.text.trim()
+      queue.push({ kind: 'review', text, context: (await read($, useContext)) ? contextNow() : '' })
+      prevPrompts = [...prevPrompts, text].slice(-PREV_PROMPTS)
+      await update($, pending, list => [...list, text])
+      startTicking($)
+    }
 
-    return next(e)
+    return r
   }).catch(($, e, next) => next(e))
+
+  // The engine keeps a slash command and its reply in the conversation the
+  // model reads. /tutor's are blanked there (the person saw them on screen),
+  // so the agent never learns a tutor runs beside it.
+  on('session.append', { door: 'command' }, ($, e, next) => {
+    const content = e.message.content
+    const isTutor = (b: (typeof content)[number]) => b.type === 'text' && typeof b.text === 'string' && TUTOR_ROW.test(b.text)
+    if (!content.some(isTutor)) return next(e)
+    const blank = content.map(b => (isTutor(b) ? { ...b, text: BLANK_ROW } : b))
+
+    return next({ ...e, message: { ...e.message, content: blank } })
+  })
 
   // Reached only when /tutor runs without passing prompt.submit.
   on('command.run', { command: 'tutor' }, async ($, e) => ({ text: await toggle($, (e.args ?? '').trim()) }))
@@ -455,12 +533,19 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // While off, one button above the prompt turns it back on.
+  // While off, or on with the pane undrawn, one button above the prompt shows
+  // it, drawn above whatever else the band holds.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (e.props.hasSurvey || (await read($, isOn))) return next(e)
-    const { Button } = $.ui.resolve(e)
+    if (e.props.hasSurvey || ((await read($, isOn)) && (await read($, isPlaced)))) return next(e)
+    const { Box, Button } = $.ui.resolve(e)
+    const rest = await next(e)
 
-    return <Button key="tutor-on" label="✏ English tutor" onPress={() => turnOn($)} />
+    return (
+      <Box flexDirection="column">
+        <Button key="tutor-on" label="✏ English tutor" onPress={() => turnOn($)} />
+        {rest}
+      </Box>
+    )
   })
 
   on('turn.complete', ($, e, next) => {
@@ -519,8 +604,7 @@ export const register: Register = on => {
           for (const f of it.fixes) {
             feedback.push([
               [f.from, { color: 'red', strikethrough: true }],
-              [' → ', {}],
-              [f.to, { color: 'green' }],
+              ...(f.to === '' ? [] : ([[' → ', {}], [f.to, { color: 'green' }]] as Run[])),
               [`  ${f.why}`, { dimColor: true }],
             ])
           }
