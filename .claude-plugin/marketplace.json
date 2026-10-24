@@ -1,0 +1,13 @@
+{
+  "name": "claude-english-tutor",
+  "owner": {
+    "name": "mxzs123"
+  },
+  "description": "English practice beside your Claude Code sessions: each prompt reviewed by Haiku in a side pane",
+  "plugins": [
+    {
+      "name": "english-tutor",
+      "source": "./"
+    }
+  ]
+}

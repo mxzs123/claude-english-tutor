@@ -1,0 +1,1 @@
+{"name": "english-tutor", "version": "0.1.0", "description": "Checks or teaches the English of each prompt with Haiku, explained in Chinese; toggle with /tutor", "types": "./types/index.d.ts", "author": {"name": "mxzs123"}}
