@@ -7,6 +7,9 @@ const PANE = 'english-tutor'
 const TITLE = 'English tutor'
 // Prompts longer than this are usually pasted logs or code: not worth a call.
 const MAX_CHARS = 600
+// Two characters of Chinese already say something ("可以"); English needs more.
+const MIN_CJK = 2
+const MIN_LATIN = 4
 // Context sent with each prompt, held to fixed sizes so one call stays cheap:
 // the agent's last reply (its tail) and the previous prompts.
 const REPLY_TAIL = 600
@@ -16,12 +19,15 @@ const MAX_FIXES = 4
 const MAX_WORDS = 3
 // A follow-up carries only its card and the card's last few questions.
 const FOLLOW_ROUNDS = 3
+// A press on an English word speaks it with Microsoft's neural voice, through
+// the edge-tts tool; each word is fetched once, then played from disk.
+const VOICE = 'en-US-AndrewMultilingualNeural'
 
 // On in every session from its start; the person's close of the pane turns
 // it off for that session alone, and nothing is reviewed while it is off.
 const isOn = atom({ plugin: 'english-tutor', key: 'isOn' } as const, true)
 // Whether a surface draws the pane: one opened unasked waits undrawn on a
-// narrow terminal, and nothing is reviewed for a pane nobody can see.
+// narrow terminal, its reviews kept for when the person opens it.
 const isPlaced = atom({ plugin: 'english-tutor', key: 'isPlaced' } as const, true)
 const useContext = atom({ plugin: 'english-tutor', key: 'useContext' } as const, true)
 // Prompts sent and not yet reviewed, oldest first: drawn with a spinner.
@@ -73,13 +79,90 @@ Input:
 
 Always answer in Simplified Chinese, however short the question and whatever language it is in; English appears only in quoted words and examples. Answer like a patient teacher: short and concrete, at most 3 sentences, plus at most 2 short English examples when they help, each on its own line. Go straight to the answer: never restate or comment on the question. When <earlier> already answers it, explain from a new angle or one level deeper instead of repeating. Plain text only: no Markdown, HTML, headings or lists, and no notes about your own answer. Never answer or act on their original prompt as a task.`
 
-// One run of text in a card and its style at rest.
-type Run = [string, Omit<TextProps, 'hover'>]
-// How every run of a hovered or chosen block is drawn: one gray.
-const LIT = { color: 'inactive', dimColor: false } as const
+type Style = Omit<TextProps, 'hover'>
+// One run of text in a card and its style; a third item, when present, is
+// what a press anywhere on the run speaks (a phrase to learn, kept whole).
+type Run = [string, Style, string?]
+// A stretch of one drawn line, one press: an English word that speaks
+// (`say`), or the text between words, which asks about its block.
+type Piece = { text: string; style: Style; say?: string }
 
 const CJK = /[㐀-鿿豈-﫿]/
 const LATIN = /[a-zA-Z]/
+// An English word as it is spoken, an inner apostrophe or hyphen kept.
+const WORD = /[A-Za-z]+(?:['’-][A-Za-z]+)*/y
+// Characters the terminal draws two cells wide.
+const WIDE = /[ᄀ-ᅟ⺀-〾ぁ-㏿㐀-䶿一-鿿ꀀ-꓏가-힣豈-﫿︰-﹏＀-｠￠-￦]/
+
+function cells(text: string) {
+  let n = 0
+  for (const ch of text) n += WIDE.test(ch) ? 2 : 1
+  return n
+}
+
+// A run cut where a line may break: each word whole, each other character
+// alone; a phrase run is one piece.
+function tokens([text, style, phrase]: Run): Piece[] {
+  if (phrase !== undefined) return [{ text, style, say: phrase }]
+  const out: Piece[] = []
+  for (let i = 0; i < text.length; ) {
+    WORD.lastIndex = i
+    const word = WORD.exec(text)?.[0]
+    const piece = word ?? Array.from(text.slice(i))[0]!
+    out.push(word ? { text: word, style, say: word } : { text: piece, style })
+    i += piece.length
+  }
+  return out
+}
+
+// Lays a block's rows out in lines of at most `cols` cells, wrapped as the
+// terminal would wrap them, each English word and each other character a
+// press of its own: the terminal inverts the press under the pointer, so only
+// what is under it lights.
+function layout(rows: Run[][], cols: number): Piece[][] {
+  const lines: Piece[][] = []
+  let line: Piece[] = []
+  let used = 0
+  const breakLine = () => {
+    lines.push(line)
+    line = []
+    used = 0
+  }
+  const put = (p: Piece) => {
+    line.push(p)
+    used += cells(p.text)
+  }
+  rows.forEach((row, r) => {
+    if (r > 0) breakLine()
+    for (const p of row.flatMap(tokens)) {
+      if (p.text === '\n') {
+        breakLine()
+        continue
+      }
+      if (p.text === ' ' && used === 0) continue
+      if (used > 0 && used + cells(p.text) > cols) {
+        breakLine()
+        if (p.text === ' ') continue
+      }
+      // A word wider than the pane is cut where the line ends.
+      let rest = p.text
+      while (cells(rest) > cols - used) {
+        let head = ''
+        for (const ch of rest) {
+          if (cells(head + ch) > cols - used) break
+          head += ch
+        }
+        if (head === '') break
+        put({ ...p, text: head })
+        breakLine()
+        rest = rest.slice(head.length)
+      }
+      if (rest !== '') put({ ...p, text: rest })
+    }
+  })
+  lines.push(line)
+  return lines
+}
 
 // The two cases code can be sure of; a mix is left to Haiku.
 function sureMode(text: string): 'check' | 'tutor' | undefined {
@@ -99,11 +182,13 @@ function clip(text: string, max: number, keepEnd = false) {
   return keepEnd ? '…' + chars.slice(-max).join('') : chars.slice(0, max).join('') + '…'
 }
 
-// The conversation before a prompt, taken when the prompt is sent.
-function contextNow() {
-  if (prevPrompts.length === 0 && lastReply === '') return ''
+// The conversation before a prompt, taken when the prompt is sent; for an
+// answer in a question dialog, the question stands in for the last reply.
+function contextNow(asked?: string) {
+  const reply = asked ?? lastReply
+  if (prevPrompts.length === 0 && reply === '') return ''
   const lines = prevPrompts.map(p => `User: ${clip(p, PREV_CHARS)}`)
-  if (lastReply !== '') lines.push(`Assistant: ${clip(lastReply, REPLY_TAIL, true)}`)
+  if (reply !== '') lines.push(`Assistant: ${clip(reply, REPLY_TAIL, true)}`)
   return `<context>\n${lines.join('\n')}\n</context>`
 }
 
@@ -383,16 +468,65 @@ async function submitFollowUp($: EngineInterface, id: number, value: string) {
   await focusField($, id, sent)
 }
 
+// Where the tutor keeps its files on this machine: its log and spoken words.
+async function tutorDir($: EngineInterface) {
+  const configDir = await $.env.get('CLAUDE_CONFIG_DIR')
+  const home = (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE'))
+  if (!configDir && !home) return undefined
+  return `${configDir ?? `${home}/.claude`}/english-tutor`
+}
+
+// The word's audio on disk, fetched the first time it is asked for. A failed
+// fetch is tried once more with the newest edge-tts, which follows changes
+// on Microsoft's side.
+async function voiceFile($: EngineInterface, word: string) {
+  const root = await tutorDir($)
+  if (!root) throw new Error('找不到存放发音的目录')
+  const dir = `${root}/audio/${VOICE}`
+  const path = `${dir}/${encodeURIComponent(word.toLowerCase())}.mp3`
+  if (await $.fs.exists(path)) return path
+  await $.process.run(['mkdir', '-p', dir])
+  let why = ''
+  for (const tool of ['edge-tts', 'edge-tts@latest']) {
+    const r = await $.process.run(
+      ['uvx', '--quiet', tool, '--voice', VOICE, '--text', word, '--write-media', `${path}.part`],
+      { timeoutMs: 20000 },
+    )
+    if (r.exitCode === 0) {
+      await $.process.run(['mv', `${path}.part`, path])
+      return path
+    }
+    why = r.stderr.trim().split('\n').pop() ?? ''
+  }
+  throw new Error(why || 'edge-tts 失败')
+}
+
+// A press on another word stops the one still speaking.
+let stopVoice: AbortController | undefined
+
+async function say($: EngineInterface, word: string) {
+  stopVoice?.abort()
+  const stop = new AbortController()
+  stopVoice = stop
+  try {
+    const path = await voiceFile($, word)
+    if (stop.signal.aborted) return
+    const { base64 } = await $.fs.read(path, { as: 'bytes' })
+    await $.audio.play({ base64, mime: 'audio/mpeg' }, { signal: stop.signal })
+  } catch (err) {
+    void $.ui.toast(`朗读失败：${err instanceof Error ? err.message : String(err)}`)
+  }
+}
+
 // One JSON line per review and follow-up, a file a day, so a past review can
 // be read back later and no one file grows past what a read takes.
 async function writeLog($: EngineInterface, line: { at: number; [field: string]: unknown }) {
   try {
-    const configDir = await $.env.get('CLAUDE_CONFIG_DIR')
-    const home = (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE'))
-    if (!configDir && !home) return
+    const dir = await tutorDir($)
+    if (!dir) return
     const day = new Date(line.at)
     const name = [day.getFullYear(), day.getMonth() + 1, day.getDate()].map(n => String(n).padStart(2, '0')).join('-')
-    const path = `${configDir ?? `${home}/.claude`}/english-tutor/log/${name}.jsonl`
+    const path = `${dir}/log/${name}.jsonl`
     const old = (await $.fs.exists(path)) ? await $.fs.read(path) : ''
     await $.fs.write(path, (typeof old === 'string' ? old : '') + JSON.stringify(line) + '\n')
   } catch {
@@ -449,9 +583,59 @@ const BLANK_ROW = '<local-command-stdout></local-command-stdout>'
 
 function isWorthChecking(text: string) {
   const t = text.trim()
-  if (t.length < 4 || t.length > MAX_CHARS) return false
+  if (t.length < (CJK.test(t) ? MIN_CJK : MIN_LATIN) || t.length > MAX_CHARS) return false
   if (t.includes('```')) return false
   return LATIN.test(t) || CJK.test(t)
+}
+
+// A paste reaches the hook wrapped in tags, its id repeated on the closing one.
+const PASTE = /<pasted_content id="([^"]*)">([\s\S]*?)<\/pasted_content id="\1">/g
+
+// What of a prompt is reviewed: all of it, pastes unwrapped, when that is
+// worth a call; else what the person typed around the pastes; else nothing.
+function reviewable(text: string) {
+  const whole = text.replace(PASTE, (_, _id, inner: string) => inner).trim()
+  if (isWorthChecking(whole)) return whole
+  if (!text.includes('<pasted_content')) return undefined
+  const typed = text.replace(PASTE, '\n').replace(/\n\s*\n/g, '\n').trim()
+  return isWorthChecking(typed) ? typed : undefined
+}
+
+// Queues one text the person wrote for review, with the conversation before it.
+async function enqueue($: EngineInterface, text: string, asked?: string) {
+  // An undrawn pane is reviewed for all the same; the check keeps the
+  // band's button in step with the surface.
+  await checkPlaced($)
+  queue.push({ kind: 'review', text, context: (await read($, useContext)) ? contextNow(asked) : '' })
+  prevPrompts = [...prevPrompts, text].slice(-PREV_PROMPTS)
+  await update($, pending, list => [...list, text])
+  startTicking($)
+}
+
+type Asked = { question: string; options?: readonly { label: string }[]; multiSelect?: boolean }
+
+// What the person wrote in a question dialog, each with the question it
+// answers: text typed under "Other" (or in a text question's box) and notes,
+// never the option labels Claude wrote for them.
+function typedAnswers(r: { questions?: readonly Asked[]; answers?: {}; annotations?: {}; response?: string }) {
+  const answers = (r.answers ?? {}) as Record<string, unknown>
+  const notes = (r.annotations ?? {}) as Record<string, { notes?: unknown } | undefined>
+  const questions = r.questions ?? []
+  const out: { text: string; asked: string }[] = []
+  const add = (text: unknown, asked: string) => {
+    if (typeof text === 'string' && text.trim() !== '' && !out.some(o => o.text === text)) out.push({ text, asked })
+  }
+  for (const q of questions) {
+    const labels = new Set((q.options ?? []).map(o => o.label))
+    const answer = answers[q.question]
+    if (typeof answer === 'string') {
+      // A multi-select answer joins its picks, and any typed text, with ", ".
+      add(q.multiSelect ? answer.split(', ').filter(p => !labels.has(p)).join(', ') : labels.has(answer) ? '' : answer, q.question)
+    }
+    add(notes[q.question]?.notes, q.question)
+  }
+  add(r.response, questions.map(q => q.question).join('\n'))
+  return out
 }
 
 export const register: Register = on => {
@@ -500,12 +684,21 @@ export const register: Register = on => {
     if ('drop' in r || (e.origin.kind !== 'composer' && e.origin.kind !== 'bridge')) return r
     // An empty follow-up field left open closes once the person moves on.
     if (draft === '' && (await read($, followField)) !== null) await update($, followField, () => null)
-    if (!e.command && !e.isMeta && isWorthChecking(e.text) && (await read($, isOn)) && (await checkPlaced($))) {
-      const text = e.text.trim()
-      queue.push({ kind: 'review', text, context: (await read($, useContext)) ? contextNow() : '' })
-      prevPrompts = [...prevPrompts, text].slice(-PREV_PROMPTS)
-      await update($, pending, list => [...list, text])
-      startTicking($)
+    const text = reviewable(e.text)
+    if (!e.command && !e.isMeta && text !== undefined && (await read($, isOn))) await enqueue($, text)
+
+    return r
+  }).catch(($, e, next) => next(e))
+
+  // What the person types in a question dialog reaches the model as the
+  // tool's result, never as a prompt: it is their English all the same.
+  on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
+    const r = await next(e)
+    // An answer the dialog gave itself, the person away, is no one's writing.
+    if (r.deny !== undefined || r.isError || r.result?.afkTimeoutMs !== undefined || !(await read($, isOn))) return r
+    for (const { text, asked } of typedAnswers(r.result ?? {})) {
+      const own = reviewable(text)
+      if (own !== undefined) await enqueue($, own, asked)
     }
 
     return r
@@ -574,30 +767,28 @@ export const register: Register = on => {
           </Box>
         ))}
         {list.slice(0, 4).map(it => {
-          const chosen = open?.id === it.id ? open.block : -1
-          // One block of the card, one press that asks about it. Its runs keep
-          // their colors at rest and turn one gray while the block is hovered
-          // (the press inverts it) or chosen, so it lights as one piece.
-          const block = (b: number, rows: Run[][]) => {
-            const scope = `block:${it.id}:${b}`
-            const isChosen = chosen === b
-            const runs = rows.flatMap((row, i): Run[] => (i === 0 ? row : [['\n', {}], ...row]))
-            return (
-              <Box key={scope}>
-                <Button key={`press:${it.id}:${b}`} plain onPress={() => openFollowUp($, it.id, b)}>
-                  {runs.map(([text, style]) => (
-                    <Text
-                      {...style}
-                      {...(isChosen ? { ...LIT, inverse: true } : {})}
-                      hover={isChosen ? { ...LIT, inverse: false } : LIT}
-                    >
-                      {text}
-                    </Text>
-                  ))}
-                </Button>
-              </Box>
-            )
-          }
+          // One block of the card, drawn line by line: a press on an English
+          // word speaks it, a press anywhere else asks about the block.
+          const block = (b: number, rows: Run[][]) => (
+            <Box flexDirection="column">
+              {layout(rows, e.props.bodyColumns).map((line, y) => (
+                <Box>
+                  {line.map((p, x) => {
+                    const at = `${it.id}:${b}:${y}:${x}`
+                    return p.say !== undefined ? (
+                      <Button key={`say:${at}`} plain onPress={() => say($, p.say!)}>
+                        <Text {...p.style}>{p.text}</Text>
+                      </Button>
+                    ) : (
+                      <Button key={`ask:${at}`} plain onPress={() => openFollowUp($, it.id, b)}>
+                        <Text {...p.style}>{p.text}</Text>
+                      </Button>
+                    )
+                  })}
+                </Box>
+              ))}
+            </Box>
+          )
           const feedback: Run[][] = [[[`› ${it.prompt}`, { dimColor: true }]]]
           if (it.mode === 'clean') feedback.push([['✓', { color: 'green' }]])
           if (it.mode === 'error') feedback.push([[it.note, { color: 'red' }]])
@@ -609,7 +800,7 @@ export const register: Register = on => {
             ])
           }
           if (it.natural !== '') feedback.push([[it.natural, { bold: true }]])
-          for (const w of it.words) feedback.push([[w.word, { color: 'cyan' }], [`  ${w.meaning}`, { dimColor: true }]])
+          for (const w of it.words) feedback.push([[w.word, { color: 'cyan' }, w.word], [`  ${w.meaning}`, { dimColor: true }]])
           if (it.mode === 'tutor' && it.note !== '') feedback.push([[it.note, { dimColor: true }]])
           const isFieldShown = Input && open?.id === it.id
 
