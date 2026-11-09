@@ -164,6 +164,20 @@ function layout(rows: Run[][], cols: number): Piece[][] {
   return lines
 }
 
+// A row cut into lines at each newline only, for a surface that wraps text
+// itself (desktop, VS Code, mobile): the surface's own font and width decide
+// where a line breaks, never the terminal's cells.
+function splitRuns(row: Run[]): Run[][] {
+  const lines: Run[][] = [[]]
+  for (const [text, style, phrase] of row) {
+    text.split('\n').forEach((part, i) => {
+      if (i > 0) lines.push([])
+      if (part !== '') lines[lines.length - 1]!.push([part, style, phrase])
+    })
+  }
+  return lines
+}
+
 // The two cases code can be sure of; a mix is left to Haiku.
 function sureMode(text: string): 'check' | 'tutor' | undefined {
   if (!CJK.test(text)) return 'check'
@@ -591,9 +605,14 @@ function isWorthChecking(text: string) {
 // A paste reaches the hook wrapped in tags, its id repeated on the closing one.
 const PASTE = /<pasted_content id="([^"]*)">([\s\S]*?)<\/pasted_content id="\1">/g
 
+// Notes a host adds to the person's prompt (the desktop app puts one before a
+// session's first prompt, thousands of characters long): never their words.
+const REMINDER = /<system-reminder>[\s\S]*?<\/system-reminder>/g
+
 // What of a prompt is reviewed: all of it, pastes unwrapped, when that is
 // worth a call; else what the person typed around the pastes; else nothing.
-function reviewable(text: string) {
+function reviewable(raw: string) {
+  const text = raw.replace(REMINDER, '').trim()
   const whole = text.replace(PASTE, (_, _id, inner: string) => inner).trim()
   if (isWorthChecking(whole)) return whole
   if (!text.includes('<pasted_content')) return undefined
@@ -756,17 +775,104 @@ export const register: Register = on => {
     const waiting = await read($, pending)
     const open = await read($, followField)
     const asked = await read($, followPending)
-    const spin = FRAMES[await read($, frame)] ?? FRAMES[0]
+    // The spinner turns on the terminal alone: a frame read here redraws the
+    // pane on every tick, and a surface with a native field (desktop) redraws
+    // its focus ring each time, so it flashes. There the wait is drawn still.
+    const spin = e.surface === 'terminal' ? (FRAMES[await read($, frame)] ?? FRAMES[0]) : ''
 
     return (
       <Box flexDirection="column">
         {[...waiting].reverse().map(text => (
           <Box flexDirection="column" marginBottom={1}>
             <Text dimColor wrap="truncate-end">› {text}</Text>
-            <Text color="cyan">{`${spin} thinking…`}</Text>
+            <Text color="cyan">{`${spin} thinking…`.trim()}</Text>
           </Box>
         ))}
         {list.slice(0, 4).map(it => {
+          // A surface that draws a Button as a native button (desktop, VS Code,
+          // mobile) pads each one, so a press per word spreads the text apart:
+          // there each line is one paragraph the surface wraps.
+          const paragraph = (runs: Run[]) => (
+            <Text>
+              {runs.map(([text, style]) => (
+                <Text {...style}>{text}</Text>
+              ))}
+            </Text>
+          )
+          // A block's first line, with the button that asks about the block at
+          // its end, where the surface has a field to ask in.
+          const header = (b: number, text: string) => (
+            <Box flexDirection="row" alignItems="flex-start" columnGap={1}>
+              <Box flexGrow={1} flexShrink={1}>
+                <Text dimColor>› {text}</Text>
+              </Box>
+              {Input && (
+                <Button key={`ask:${it.id}:${b}`} plain dimColor onPress={() => openFollowUp($, it.id, b)}>
+                  追问
+                </Button>
+              )}
+            </Box>
+          )
+          // A section's small title, so the sentence and the words read apart.
+          const label = (text: string) => <Text dimColor size="caption">{text}</Text>
+          // The feedback as sections: the fixes, the whole sentence as a native
+          // speaker writes it, the words to learn (each a press that says it),
+          // then the note.
+          const flowFeedback = () => (
+            <Box flexDirection="column">
+              {header(0, it.prompt)}
+              {it.mode === 'clean' && <Text color="green">✓ 很自然</Text>}
+              {it.mode === 'error' && <Text color="red">{it.note}</Text>}
+              {it.fixes.length > 0 && (
+                <Box flexDirection="column" marginTop={1}>
+                  {label('改正')}
+                  {it.fixes.map(f => (
+                    <Box flexDirection="column">
+                      {paragraph([
+                        [f.from, { color: 'red', strikethrough: true }],
+                        ...(f.to === '' ? [] : ([[' → ', {}], [f.to, { color: 'green' }]] as Run[])),
+                      ])}
+                      {f.why !== '' && <Text dimColor size="footnote">{f.why}</Text>}
+                    </Box>
+                  ))}
+                </Box>
+              )}
+              {it.natural !== '' && (
+                <Box flexDirection="column" marginTop={1}>
+                  {label(it.mode === 'check' ? '更自然的说法' : '英文说法')}
+                  <Text weight="semibold" size="heading">{it.natural}</Text>
+                </Box>
+              )}
+              {it.words.length > 0 && (
+                <Box flexDirection="column" marginTop={1}>
+                  {label('单词')}
+                  {it.words.map(w => (
+                    <Box flexDirection="row" alignItems="center" columnGap={1}>
+                      <Button key={`say:${it.id}:${w.word}`} plain onPress={() => say($, w.word)}>
+                        <Text color="cyan">{w.word}</Text>
+                      </Button>
+                      <Box flexShrink={1}>
+                        <Text dimColor>{w.meaning}</Text>
+                      </Box>
+                    </Box>
+                  ))}
+                </Box>
+              )}
+              {it.mode === 'tutor' && it.note !== '' && (
+                <Box marginTop={1}>
+                  <Text dimColor size="footnote">{it.note}</Text>
+                </Box>
+              )}
+            </Box>
+          )
+          // A follow-up: the question, then the answer line by line.
+          const flowFollowUp = (b: number, f: FollowUp) => (
+            <Box flexDirection="column">
+              {header(b, f.q)}
+              {splitRuns([[f.a.replace(/\n{2,}/g, '\n'), f.isError ? { color: 'red' } : {}]]).map(paragraph)}
+            </Box>
+          )
+          const isFlow = e.surface !== 'terminal'
           // One block of the card, drawn line by line: a press on an English
           // word speaks it, a press anywhere else asks about the block.
           const block = (b: number, rows: Run[][]) => (
@@ -806,10 +912,10 @@ export const register: Register = on => {
 
           return (
             <Box flexDirection="column" marginBottom={1}>
-              {block(0, feedback)}
+              {isFlow ? flowFeedback() : block(0, feedback)}
               {(it.followUps ?? []).map((f, k) => (
                 <Box marginTop={1}>
-                  {block(k + 1, [
+                  {isFlow ? flowFollowUp(k + 1, f) : block(k + 1, [
                     [[`› ${f.q}`, { dimColor: true }]],
                     [[f.a.replace(/\n{2,}/g, '\n'), f.isError ? { color: 'red' } : {}]],
                   ])}
@@ -818,10 +924,21 @@ export const register: Register = on => {
               {asked.filter(q => q.id === it.id).map(q => (
                 <Box flexDirection="column" marginTop={1}>
                   <Text dimColor>› {q.q}</Text>
-                  <Text color="cyan">{`${spin} thinking…`}</Text>
+                  <Text color="cyan">{`${spin} thinking…`.trim()}</Text>
                 </Box>
               ))}
-              {isFieldShown && (
+              {isFieldShown && isFlow && (
+                // The field on a row of its own, full width, with room below it
+                // for the surface's focus ring.
+                <Box flexDirection="column" marginTop={1} paddingBottom={1}>
+                  <Input
+                    key={`follow:${it.id}:${open.sent}`}
+                    onInput={(value: string) => { draft = value }}
+                    onSubmit={(value: string) => submitFollowUp($, it.id, value)}
+                  />
+                </Box>
+              )}
+              {isFieldShown && !isFlow && (
                 <Box marginTop={1}>
                   <Text dimColor>› </Text>
                   <Input

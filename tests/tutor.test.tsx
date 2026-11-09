@@ -418,3 +418,36 @@ test('lines wrap at the pane width with every word kept whole and each other cha
   expect(lines[10]).toBe(lines[0]! + 1)
   await pane.unmount()
 })
+
+test('on desktop the card reads in sections: the sentence whole, the words each a press, one button asks', async ($, on) => {
+  const natural = 'Please move the user settings into the settings folder.'
+  const { sent, played, runs } = stub(on, () => JSON.stringify({ mode: 'tutor', natural, fixes: [], words: [{ word: 'settings folder', meaning: '设置文件夹' }], note: '把设置移到设置文件夹里' }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.prompt.submit(typed('把用户设置挪到 settings 文件夹'))
+  await until(() => sent.length === 1)
+
+  const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  // Only the ask and the words to learn are presses: no speaker, no word of the sentence alone.
+  expect((await pane.findAll({ type: 'Button' })).map(b => b.key)).toEqual(['ask:1:0', 'say:1:settings folder'])
+  const texts = (await pane.findAll({ type: 'Text' })).map(t => t.text)
+  expect(texts).toContain(natural)
+  expect(texts).toContain('英文说法')
+  expect(texts).toContain('把设置移到设置文件夹里')
+  await pane.press({ key: 'say:1:settings folder' })
+  await until(() => played.length === 1)
+  const fetch = runs.filter(argv => argv.includes('--text')).pop()!
+  expect(fetch[fetch.indexOf('--text') + 1]).toBe('settings folder')
+  // The field stands on a row of its own, full width.
+  await pane.press({ key: 'ask:1:0' })
+  expect((await pane.find({ type: 'Input' }))?.key).toBe('follow:1:0')
+  await pane.unmount()
+})
+
+test("a host's system reminder before the first prompt is left out, the person's words reviewed", async ($, on) => {
+  const { sent } = stub(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.prompt.submit(typed(`<system-reminder>\n${'The user started this session without a folder. '.repeat(90)}\n</system-reminder>\n你好`))
+  await until(() => sent.length === 1)
+  expect(sent[0]).toContain('<prompt>\n你好\n</prompt>')
+  expect(sent[0]).not.toContain('system-reminder')
+})
